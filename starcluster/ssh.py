@@ -24,6 +24,7 @@ except ImportError:
     HAS_TERMIOS = False
 
 from starcluster import exception
+from starcluster import progressbar
 from starcluster.logger import log
 
 
@@ -51,6 +52,7 @@ class SSHClient(object):
         self._timeout = timeout
         self._sftp = None
         self._transport = None
+        self._progress_bar = None
         if private_key:
             self._pkey = self.load_private_key(private_key, private_key_pass)
         elif not password:
@@ -326,6 +328,24 @@ class SSHClient(object):
         """
         return self.sftp.stat(path)
 
+    @property
+    def progress_bar(self):
+        if not self._progress_bar:
+            widgets = ['FileTransfer: ', ' ', progressbar.Percentage(), ' ',
+                       progressbar.Bar(marker=progressbar.RotatingMarker()),
+                       ' ', progressbar.ETA(), ' ',
+                       progressbar.FileTransferSpeed()]
+            pbar = progressbar.ProgressBar(widgets=widgets,
+                                           maxval=1,
+                                           force_update=True)
+            self._progress_bar = pbar
+        return self._progress_bar
+
+    def _file_transfer_progress(self, numbytes, total):
+        pbar = self.progress_bar
+        pbar.maxval = total
+        pbar.update(numbytes)
+
     def get(self, remotepath, localpath=None):
         """
         Copies a file between the remote host and the local host.
@@ -335,13 +355,70 @@ class SSHClient(object):
         self.sftp_connect()
         self.sftp.get(remotepath, localpath)
 
+    def _get_local_permissions(self, fpath):
+        return os.stat(fpath).st_mode & 0777
+
+    def _put_dir_walker(self, path_info, dirname, names):
+        localpathrel, remotedir = path_info
+        if not self.isdir(posixpath.join(remotedir, dirname)):
+            self.makedirs(posixpath.join(remotedir, dirname))
+        for name in names:
+            name = name.replace(localpathrel, '')
+            fpath = os.path.join(os.path.abspath(dirname), name)
+            sdirname = dirname.replace(localpathrel, '')
+            rpath = posixpath.join(remotedir, sdirname, name)
+            if os.path.isdir(fpath):
+                if not self.isdir(rpath):
+                    self.makedirs(rpath)
+                continue
+            log.debug("fpath = %s, rpath = %s" % (fpath, rpath))
+            self.progress_bar.widgets[0] = fpath
+            self.sftp.put(fpath, rpath, callback=self._file_transfer_progress)
+            self.chmod(self._get_local_permissions(fpath), rpath)
+            self.progress_bar.reset()
+
+    def _put(self, localpath, remotepath=None):
+        if os.path.isfile(localpath):
+            if self.isdir(remotepath):
+                fname = os.path.basename(localpath)
+                remotepath = posixpath.join(remotepath, fname)
+            self.progress_bar.widgets[0] = localpath
+            self.sftp.put(localpath, remotepath,
+                          callback=self._file_transfer_progress)
+            self.chmod(self._get_local_permissions(localpath), remotepath)
+            self.progress_bar.reset()
+        elif os.path.isdir(localpath):
+            #remotepath = posixpath.join(remotepath,
+                                        #os.path.basename(localpath))
+            localpathrel = os.path.split(os.path.abspath(localpath))[0]
+            localpathrel += os.path.sep
+            os.path.walk(localpath, self._put_dir_walker, [localpathrel,
+                                                           remotepath])
+        else:
+            raise IOError(2, "File or directory does not exist: %s" %
+                          localpath)
+
     def put(self, localpath, remotepath=None):
         """
         Copies a file between the local host and the remote host.
         """
+        localpath = os.path.abspath(localpath)
         if not remotepath:
-            remotepath = os.path.split(localpath)[1]
-        self.sftp.put(localpath, remotepath)
+            # default to user's home folder
+            remotepath = self.get_env()['HOME']
+        if not posixpath.isabs(remotepath):
+            remotepath = posixpath.join(self.get_env()['HOME'], remotepath)
+        print remotepath
+        print localpath
+        try:
+            return self._put(localpath, remotepath)
+        except IOError, e:
+            if e.errno == 13:
+                uname = self.transport.get_username()
+                raise exception.SSHPermissionDenied(uname)
+            #elif e.errno == 2:
+                #raise exception.BaseException(e.strerror)
+            raise
 
     def execute_async(self, command):
         """
@@ -445,9 +522,7 @@ class SSHClient(object):
         if self._transport:
             self._transport.close()
 
-    def interactive_shell(self, user='root'):
-        if user and self.transport.get_username() != user:
-            self.connect(username=user)
+    def interactive_shell(self):
         try:
             chan = self.transport.open_session()
             chan.get_pty()
@@ -515,9 +590,6 @@ class SSHClient(object):
 
         writer = threading.Thread(target=writeall, args=(chan,))
         writer.start()
-
-        # needs to be sent to give vim correct size FIX
-        chan.send('eval $(resize)\n')
 
         try:
             while True:

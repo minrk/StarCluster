@@ -55,6 +55,11 @@ class SSHNoCredentialsError(SSHError):
         self.msg = "No password or key specified"
 
 
+class SSHPermissionDenied(SSHError):
+    def __init__(self, user):
+        self.msg = "Permission denied for user %s" % user
+
+
 class AWSError(BaseException):
     """Base exception for all AWS related errors"""
 
